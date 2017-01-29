@@ -7,6 +7,7 @@ import xml.etree.ElementTree as ET
 import random
 import ConfigParser
 import re
+import socket
 
 
 IRC_SERVER_HOSTNAME = ""
@@ -41,6 +42,7 @@ MAGIC_8BALL_ANSWERS = [
     ]
 replies = {}
 quotes = []
+tells = {}
 
 
 ##################################################
@@ -49,8 +51,16 @@ def get8ball():
     randnum = random.randint(1,len(MAGIC_8BALL_ANSWERS)) - 1
     return MAGIC_8BALL_ANSWERS[randnum]
 
-def getRandomReply():
-    return ""
+def doRandomReply(irc, message):
+    for key in replies.keys():
+        if key in "*" or key in message:
+            chance = replies[key][0]
+            answers = replies[key][1]
+            randnum = random.randint(1,100)
+            if (randnum <= chance):
+                randmsg = random.randint(1,len(answers))
+                irc.send(IRC_CHANNEL, answers[randmsg-1])
+                break
 
 def getWeatherLocation(location):
     weather = ""
@@ -199,26 +209,41 @@ def doNews(irc, message, search):
     for news in getNews(search, numNews):
         irc.send(IRC_CHANNEL, news)
 
-def getRedditTop(count):
+def getReddit(category, count):
     articles = []
-    url = "https://www.reddit.com/top/.json"
+    url = "https://www.reddit.com/"+category+"/.json"
     try:
         req = requests.get(url)
         jsonString = json.loads(req.content)
         #print jsonString
         for i in range(count):
-            articles.append((jsonString['data']['children'][i]['data']['subreddit'] + ": " + jsonString['data']['children'][i]['data']['title'] + " - " + jsonString['data']['children'][i]['data']['url']).replace("&amp;", "&"))
+            articles.append(("["+jsonString['data']['children'][i]['data']['subreddit'] + "] " + jsonString['data']['children'][i]['data']['title'] + " - " + jsonString['data']['children'][i]['data']['url']).replace("&amp;", "&"))
     except Exception as e:
         #traceback.print_exc()
         pass
     return articles
 
-def doRedditTop(irc, message):
+def doReddit(irc, message):
     s = message.strip().split(" ")
+    category = "hot"
     numNews = 1
     if len(s) > 1:
-        numNews = int(s[1].strip())
-    for news in getRedditTop(numNews):
+        try:
+            numNews = int(s[1].strip())
+        except:
+            numNews = 1
+            category = s[1].strip()
+    if len(s) > 2:
+        if category != "hot":
+            try:
+                numNews = int(s[2].strip())
+            except:
+                pass
+        else:
+            category = s[2].strip()
+    if category not in ['new', 'hot', 'rising', 'controversial', 'top', 'gilded']:
+        category = "r/"+category
+    for news in getReddit(category, numNews):
         irc.send(IRC_CHANNEL, news)
 
 def getDefine(search):
@@ -240,6 +265,33 @@ def doDefine(irc, message):
     if len(s) > 1:
         irc.send(IRC_CHANNEL, getDefine(s[1].strip()))
 
+def getWiki(search):
+    result = ""
+    search = search.replace(" ","%20")
+    url = "http://en.wikipedia.org/w/api.php?format=json&action=query&prop=extracts&titles="+search+"&exintro=&redirects=true"
+    try:
+        req = requests.get(url)
+        jsonString = json.loads(req.content)
+        key = jsonString['query']['pages'].keys()[0]
+        result = jsonString['query']['pages'][key]['extract']
+        result = result.replace("<b>", "")
+        result = result.replace("</b>", "")
+        result = result.replace("<i>", "")
+        result = result.replace("</i>", "")
+        result = result.replace("<p>", "")
+        result = result.replace("</p>", "")
+        result = result.replace("<small>", "")
+        result = result.replace("</small>", "")
+    except Exception as e:
+        #traceback.print_exc()
+        pass
+    return result
+
+def doWiki(irc, message):
+    s = message.split("wiki")
+    if len(s) > 1:
+        irc.send(IRC_CHANNEL, getWiki(s[1].strip()))
+
 def doQuote(irc, message):
     num = 0
     try:
@@ -253,6 +305,13 @@ def doQuote(irc, message):
     if num == 0:
         num = random.randint(1,len(quotes))
     irc.send(IRC_CHANNEL, "Quote #"+str(num)+": "+quotes[num-1])
+
+def doRoulette(irc, sender):
+    randnum = random.randint(1,6) - 1
+    if randnum == 0:
+        irc.command("KICK " + IRC_CHANNEL + " " + sender + " BANG!")
+    else:
+        irc.send(IRC_CHANNEL, "*click*")
 
 def getLinkTitle(url):
     print "getting link title for "+url
@@ -299,7 +358,7 @@ def loadQuotes():
     global quotes
     quotes = []
     for line in f.readlines():
-        quotes.append(line)
+        quotes.append(line.strip())
     f.close()
 
 def loadOpIps():
@@ -307,7 +366,7 @@ def loadOpIps():
     global opips
     opips = []
     for line in f.readlines():
-        opips.append(line)
+        opips.append(line.strip())
     f.close()
 
 def loadFiles():
@@ -315,28 +374,97 @@ def loadFiles():
     loadQuotes()
     loadOpIps()
 
+def getSender(text):
+    sender = text[1:text.index('!')]
+    return sender
+
+def getHostname(text):
+    hostname = ""
+    pattern = re.compile("^:\w+!~\w+\@(\S+)\s")
+    hostnames = re.findall(pattern, text)
+    if len(hostnames) > 0:
+        hostname = hostnames[0]
+    return hostname
+
+def isOpIP(hostname):
+    try:
+        ipaddress = socket.gethostbyname(hostname)
+        #print "ip address="+ipaddress
+        if ipaddress in opips:
+            return True
+    except:
+        pass
+    return False
+
+def doTell(irc, message, sender):
+    global tells
+    s = message.strip().split("tell")
+    if len(s) > 1:
+        content = s[1].strip()
+        i = content.find(" ")
+        if i > 0:
+            receiver = content[0:i].lower()
+            message = content[i+1:]
+            messageList = []
+            if receiver in tells.keys():
+                messageList = tells[receiver]
+            messageList.append(" <"+sender+"> tell "+receiver+" "+message)
+            tells[receiver] = messageList
+            irc.send(IRC_CHANNEL, sender+": I'll pass that on when "+receiver+" is around.")
+        else:
+            irc.send(IRC_CHANNEL, "tell "+content+" what?")
+    else:
+        irc.send(IRC_CHANNEL, "tell who?")
+
+def checkOp(irc, sender, hostname):
+    if isOpIP(hostname):
+        irc.command("MODE " + IRC_CHANNEL + " +o " + sender)
+
+def checkTells(irc, sender):
+    global tells
+    sender = sender.lower()
+    if sender in tells.keys():
+        messageList = tells[sender]
+        for message in messageList:
+            irc.send(IRC_CHANNEL, message)
+        del tells[sender]
+
 def runIRC():
     irc = IRC()
     irc.connect(IRC_SERVER_HOSTNAME, IRC_CHANNEL, IRC_NICK)
     while True:
         text = irc.get_text()
         print "IRC got: "+text
-        #checkTells()
+        onJoin = "JOIN :" + IRC_CHANNEL
+        if onJoin in text:
+            sender = getSender(text)
+            hostname = getHostname(text)
+            checkOp(irc, sender, hostname)
+            checkTells(irc, sender)
+            continue
         onMessage = "PRIVMSG " + IRC_CHANNEL + " :"
         if onMessage in text:
             message = text.split(onMessage)[1]
+            sender = getSender(text)
+            checkTells(irc, sender)
             if message.startswith(".reload"):
                 loadFiles()
+            elif message.startswith(".tell"):
+                doTell(irc, message, sender)
             elif message.startswith(".define"):
                 doDefine(irc, message)
+            elif message.startswith(".wiki"):
+                doWiki(irc, message)
             elif message.startswith(".news"):
                 doNews(irc, message, "")
             elif message.startswith(".spnews"):
                 doNews(irc, message, "smashing pumpkins")
             elif message.startswith(".reddit"):
-                doRedditTop(irc, message)
+                doReddit(irc, message)
             elif message.startswith(".8"):
                 irc.send(IRC_CHANNEL, get8ball())
+            elif message.startswith(".roulette"):
+                doRoulette(irc, sender)
             elif message.startswith(".wzfd"):
                 doWZFD(irc, message)
             elif message.startswith(".wzf"):
@@ -350,7 +478,7 @@ def runIRC():
             elif "http://" in message or "https://" in message:
                 doLinkTitle(irc, message)
             else:
-                irc.send(IRC_CHANNEL, getRandomReply())
+                doRandomReply(irc, message)
 
 
 ##################################################
